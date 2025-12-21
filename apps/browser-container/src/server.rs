@@ -3,9 +3,10 @@ use axum::extract::WebSocketUpgrade;
 use axum::extract::ws::WebSocket;
 use axum::{Router, response::IntoResponse, routing::any};
 use chromiumoxide::Browser;
+use futures::stream::{SplitSink, SplitStream};
 use futures_util::{sink::SinkExt, stream::StreamExt};
 use std::net::SocketAddr;
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::{WebSocketStream, connect_async};
 use tungstenite::client::IntoClientRequest;
 
 use crate::launcher;
@@ -26,85 +27,145 @@ pub async fn serve() -> anyhow::Result<(), anyhow::Error> {
 }
 
 async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
-    ws.on_upgrade(handle_socket_proxy)
+    ws.on_upgrade(async |socket| {
+        if let Err(err) = handle_socket_proxy(socket).await {
+            tracing::error!("exited handle_socket_proxy unexpectedly with {}", err);
+        };
+    })
 }
 
 // our server forwards messages to/from the client to/from the browser
-async fn handle_socket_proxy(client_socket: WebSocket) {
-    // TODO: dont unwrap and move to pool structure
-    let browser_info = launcher::launch_browser().await.unwrap();
-    let browser = browser_info.browser;
-    let mut browser_handler = browser_info.handler;
-    let _handle = tokio::spawn(async move {
-        while let Some(h) = browser_handler.next().await {
-            if h.is_err() {
-                break;
-            }
-        }
+async fn handle_socket_proxy(client_socket: WebSocket) -> anyhow::Result<()> {
+    let (mut browser, browser_handler) = launcher::launch_browser()
+        .await
+        .context("failed to launch browser")?;
+
+    // This should only finish on an errror
+    let handler_task = tokio::spawn(async move {
+        launcher::poll_browser_handler(browser_handler).await;
     });
 
-    let browser_stream = connect_to_browser(browser).await.unwrap();
-    let (mut browser_sender, mut browser_recv) = browser_stream.split();
+    handle_proxy(&browser, client_socket).await?;
 
-    let (mut client_sender, mut client_recv) = client_socket.split();
-
-    // client -> browser
-    let mut client_to_browser_task = tokio::spawn(async move {
-        while let Some(Ok(msg)) = client_recv.next().await {
-            let browser_msg = axum_msg_to_tungstenite(msg);
-            if browser_sender.send(browser_msg).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // browser -> client
-    let mut browser_to_client_task = tokio::spawn(async move {
-        while let Some(Ok(msg)) = browser_recv.next().await {
-            let client_msg = tungstenite_msg_to_axum(msg);
-            if client_sender.send(client_msg).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // If any one of the tasks exit, abort the other.
-    tokio::select! {
-        ctb_res = (&mut client_to_browser_task) => {
-            match ctb_res {
-                Ok(_) => println!("client to browser proxy finished"),
-                Err(err) => println!("err forwarding messages {err:?}")
-            }
-            browser_to_client_task.abort();
-        },
-        btc_res = (&mut browser_to_client_task) => {
-            match btc_res {
-                Ok(_) => println!("browser to client proxy finished"),
-                Err(err) => println!("err forwarding messages {err:?}")
-            }
-            client_to_browser_task.abort();
-        }
+    // Cleanup: close browser and wait for handler
+    tracing::debug!("Closing browser");
+    if let Err(e) = browser.close().await {
+        tracing::warn!("Error closing browser: {:#}", e);
     }
+
+    handler_task.abort();
+    let _ = handler_task.await;
+    Ok(())
 }
 
-// Connects to the browsers websocket port and returns the sender and reciever handles
-async fn connect_to_browser(
-    browser: Browser,
+async fn handle_proxy(browser: &Browser, client_socket: WebSocket) -> anyhow::Result<()> {
+    let browser_stream = connect_to_browser_ws(&browser)
+        .await
+        .context("failed to connect to browser")?;
+    let (browser_tx, browser_rx) = browser_stream.split();
+    let (client_tx, client_rx) = client_socket.split();
+
+    // race whichever proxy side disconnects
+    tokio::select! {
+        _ = forward_client_to_browser(client_rx, browser_tx) => {},
+        _ = forward_browser_to_client(browser_rx, client_tx) => {},
+    }
+
+    Ok(())
+}
+
+// Connects to the browsers websocket port and returns the websocket stream
+async fn connect_to_browser_ws(
+    browser: &Browser,
 ) -> anyhow::Result<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    anyhow::Error,
 > {
     let addr = browser.websocket_address();
-    let request = addr.into_client_request().context("into client req")?;
+    let request = addr
+        .into_client_request()
+        .context("failed getting websocket request")?;
 
-    let (ws_stream, _) = connect_async(request).await.context("connect browser ws")?;
-    tracing::debug!("connected to browser ws on {}", addr);
+    let (ws_stream, _) = connect_async(request)
+        .await
+        .context("failed to connect to browser websocket")?;
+    tracing::debug!("Connected to browser websocket at {}", addr);
 
     Ok(ws_stream)
 }
 
-fn tungstenite_msg_to_axum(msg: tungstenite::Message) -> axum::extract::ws::Message {
-    return match msg {
+// Forwards client ws msgs to browser ws msgs
+async fn forward_client_to_browser(
+    mut client_rx: SplitStream<WebSocket>,
+    mut browser_tx: SplitSink<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        tungstenite::Message,
+    >,
+) -> anyhow::Result<()> {
+    while let Some(msg) = client_rx.next().await {
+        let msg = match msg {
+            Ok(msg) => msg,
+            Err(err) => {
+                tracing::warn!("Client message recv err: {}", err);
+                continue; // TODO: we may need to exit here, not sure
+            }
+        };
+
+        let browser_msg = match axum_to_tungstenite(msg) {
+            Ok(browser_msg) => browser_msg,
+            Err(err) => {
+                tracing::warn!("Client message convert err: {}", err);
+                continue; // TODO: we may need to exit here, not sure
+            }
+        };
+
+        if let Err(err) = browser_tx.send(browser_msg).await {
+            return Err(anyhow::anyhow!(
+                "Error forwarding message to browser: {}",
+                err
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn forward_browser_to_client(
+    mut browser_rx: SplitStream<
+        WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    >,
+    mut client_tx: SplitSink<WebSocket, axum::extract::ws::Message>,
+) -> anyhow::Result<()> {
+    while let Some(msg) = browser_rx.next().await {
+        let msg = match msg {
+            Ok(msg) => msg,
+            Err(err) => {
+                tracing::warn!("Browser message recv err: {}", err);
+                continue; // TODO: we may need to exit here, not sure
+            }
+        };
+
+        let client_msg = match tungstenite_to_axum(msg) {
+            Ok(client_msg) => client_msg,
+            Err(err) => {
+                tracing::warn!("Browser message convert err: {}", err);
+                continue; // TODO: we may need to exit here, not sure
+            }
+        };
+
+        if let Err(err) = client_tx.send(client_msg).await {
+            return Err(anyhow::anyhow!(
+                "Error forwarding message to browser: {}",
+                err
+            ));
+        }
+    }
+    Ok(())
+}
+
+// Some fuckery because axum uses tungstenite internally but doesnt let you use it
+fn tungstenite_to_axum(msg: tungstenite::Message) -> Result<axum::extract::ws::Message, String> {
+    Ok(match msg {
         tungstenite::Message::Text(text) => {
             axum::extract::ws::Message::Text(text.to_string().into())
         }
@@ -119,13 +180,13 @@ fn tungstenite_msg_to_axum(msg: tungstenite::Message) -> axum::extract::ws::Mess
             axum::extract::ws::Message::Close(close_frame)
         }
         tungstenite::Message::Frame(_) => {
-            panic!("Fix this eventually")
+            return Err("Raw frame messages are not supported".to_string());
         }
-    };
+    })
 }
 
-fn axum_msg_to_tungstenite(msg: axum::extract::ws::Message) -> tungstenite::Message {
-    return match msg {
+fn axum_to_tungstenite(msg: axum::extract::ws::Message) -> Result<tungstenite::Message, String> {
+    Ok(match msg {
         axum::extract::ws::Message::Text(text) => {
             tungstenite::Message::Text(text.to_string().into())
         }
@@ -139,5 +200,5 @@ fn axum_msg_to_tungstenite(msg: axum::extract::ws::Message) -> tungstenite::Mess
             });
             tungstenite::Message::Close(close_frame)
         }
-    };
+    })
 }

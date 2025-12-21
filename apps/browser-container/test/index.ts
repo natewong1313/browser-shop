@@ -8,7 +8,9 @@ const browser = await puppeteer.connect({
 // 	executablePath:
 // 		"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
 // });
-const page = await browser.newPage();
+// const page = await browser.newPage();
+const [page] = await browser.pages();
+if (!page) throw new Error("no page");
 
 // Navigate the page to a URL.
 await page.goto("https://developer.chrome.com/");
