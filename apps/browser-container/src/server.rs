@@ -6,9 +6,11 @@ use chromiumoxide::Browser;
 use futures::stream::{SplitSink, SplitStream};
 use futures_util::{sink::SinkExt, stream::StreamExt};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio_tungstenite::{WebSocketStream, connect_async};
 use tungstenite::client::IntoClientRequest;
 
+use crate::browser_session::{self, BrowserSession};
 use crate::launcher;
 
 pub async fn serve() -> anyhow::Result<(), anyhow::Error> {
@@ -36,30 +38,24 @@ async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
 
 // our server forwards messages to/from the client to/from the browser
 async fn handle_socket_proxy(client_socket: WebSocket) -> anyhow::Result<()> {
-    let (mut browser, browser_handler) = launcher::launch_browser()
-        .await
-        .context("failed to launch browser")?;
+    let mut browser_session = BrowserSession::launch().await?;
+    let browser_ws_addr = browser_session.ws_addr().clone();
 
     // This should only finish on an errror
-    let handler_task = tokio::spawn(async move {
-        launcher::poll_browser_handler(browser_handler).await;
+    let run_handle = tokio::spawn(async move {
+        browser_session.run().await;
     });
 
-    handle_proxy(&browser, client_socket).await?;
+    handle_proxy(browser_ws_addr, client_socket).await?;
 
-    // Cleanup: close browser and wait for handler
     tracing::debug!("Closing browser");
-    if let Err(e) = browser.close().await {
-        tracing::warn!("Error closing browser: {:#}", e);
-    }
-
-    handler_task.abort();
-    let _ = handler_task.await;
+    run_handle.abort();
+    let _ = run_handle.await;
     Ok(())
 }
 
-async fn handle_proxy(browser: &Browser, client_socket: WebSocket) -> anyhow::Result<()> {
-    let browser_stream = connect_to_browser_ws(&browser)
+async fn handle_proxy(browser_ws_addr: String, client_socket: WebSocket) -> anyhow::Result<()> {
+    let browser_stream = connect_to_browser_ws(browser_ws_addr)
         .await
         .context("failed to connect to browser")?;
     let (browser_tx, browser_rx) = browser_stream.split();
@@ -76,19 +72,19 @@ async fn handle_proxy(browser: &Browser, client_socket: WebSocket) -> anyhow::Re
 
 // Connects to the browsers websocket port and returns the websocket stream
 async fn connect_to_browser_ws(
-    browser: &Browser,
+    browser_ws_addr: String,
 ) -> anyhow::Result<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 > {
-    let addr = browser.websocket_address();
-    let request = addr
+    let request = browser_ws_addr
+        .clone()
         .into_client_request()
         .context("failed getting websocket request")?;
 
     let (ws_stream, _) = connect_async(request)
         .await
         .context("failed to connect to browser websocket")?;
-    tracing::debug!("Connected to browser websocket at {}", addr);
+    tracing::debug!("Connected to browser websocket at {}", browser_ws_addr);
 
     Ok(ws_stream)
 }
@@ -155,7 +151,7 @@ async fn forward_browser_to_client(
 
         if let Err(err) = client_tx.send(client_msg).await {
             return Err(anyhow::anyhow!(
-                "Error forwarding message to browser: {}",
+                "Error forwarding message to client: {}",
                 err
             ));
         }
