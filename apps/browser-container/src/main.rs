@@ -1,7 +1,6 @@
 use anyhow::Context;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-pub mod browser_pool;
 pub mod browser_session;
 pub mod server;
 

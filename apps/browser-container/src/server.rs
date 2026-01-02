@@ -11,7 +11,6 @@ use tokio_tungstenite::{WebSocketStream, connect_async};
 use tungstenite::client::IntoClientRequest;
 
 use crate::browser_session::{self, BrowserSession};
-use crate::launcher;
 
 pub async fn serve() -> anyhow::Result<(), anyhow::Error> {
     let app = Router::new().route("/connect", any(ws_handler));
@@ -41,16 +40,12 @@ async fn handle_socket_proxy(client_socket: WebSocket) -> anyhow::Result<()> {
     let mut browser_session = BrowserSession::launch().await?;
     let browser_ws_addr = browser_session.ws_addr().clone();
 
-    // This should only finish on an errror
-    let run_handle = tokio::spawn(async move {
-        browser_session.run().await;
-    });
-
+    // TODO: return which side ended
     handle_proxy(browser_ws_addr, client_socket).await?;
 
-    tracing::debug!("Closing browser");
-    run_handle.abort();
-    let _ = run_handle.await;
+    tracing::debug!("Proxy ended");
+    browser_session.cleanup().await;
+    drop(browser_session);
     Ok(())
 }
 
